@@ -16,31 +16,31 @@ import java.util.Iterator;
 
 public class SOCKS5Server implements Runnable{
     private final int port;
-    private int numberOfClients = 0;
+    private final String host;
     private ServerSocketChannel serverChannel; 
     private Selector selector;
 
     private static final int BUF_SIZE = 1048576;
     private static final int IPv4_LENGTH = 4;
     private static final int PORT_LENGTH = 2;
-    private int domainNameLength;
+    private int domainNameLength = 0;
 
-    public SOCKS5Server(int port) {
+    public SOCKS5Server(String host, int port) {
         this.port = port;
+        this.host = host;
         try {
             serverChannel = ServerSocketChannel.open();
-            serverChannel.socket().bind(new InetSocketAddress(port));
+            selector = Selector.open();
+            
+            serverChannel.socket().bind(new InetSocketAddress(host, port));
             serverChannel.configureBlocking(false);
             serverChannel.register(selector, serverChannel.validOps());
-
-            selector = Selector.open();
         } catch (IOException e) {
             e.printStackTrace();
         }
     }
 
     private void accept(SelectionKey key) throws IOException {
-        this.numberOfClients++;
         SocketChannel clientChannel = ((ServerSocketChannel) key.channel()).accept();
         clientChannel.configureBlocking(false);
         clientChannel.register(key.selector(), SelectionKey.OP_READ);
@@ -55,9 +55,11 @@ public class SOCKS5Server implements Runnable{
             key.attach(attachment);
         }
         try {
-            channel.read(attachment.in);
+            if (channel.read(attachment.in) < 0) {
+                close(key);
+            }
             if (attachment.status == Status.DISCONNETED) {
-                connect(key);
+                connectToServer(key);
             } else if (attachment.status == Status.CONNECTED) {
                 byte[] clientRequest = attachment.in.array();
                 byte zeroByte = clientRequest[0];
@@ -70,14 +72,18 @@ public class SOCKS5Server implements Runnable{
                         if (thirdByte == ClientRequest.IPv4_CONNECTION) {
                             String address = getAddress(clientRequest, thirdByte);
                             if (address == null) {
+                                System.out.println("Unable to connect to host");
                                 response[1] = ServerResponse.HOST_UNAVAILABLE;
                                 channel.write(ByteBuffer.wrap(response));
                                 close(key);
+                                return;
                             }
                             short clientPort = ByteBuffer.wrap(Arrays.copyOfRange(clientRequest, 4 + IPv4_LENGTH, 4 + IPv4_LENGTH + PORT_LENGTH)).getShort();
                             try {
                                 setConnection(address, clientPort, key, attachment);
+                                System.out.println("Requested connection through ip: " + address);
                             } catch (IOException e) {
+                                System.out.println("The host: " + address + " dropped the connection");
                                 response[1] = ServerResponse.CONNECTION_FAILURE;
                                 channel.write(ByteBuffer.wrap(response));
                                 close(key);
@@ -88,29 +94,36 @@ public class SOCKS5Server implements Runnable{
                                 response[1] = ServerResponse.NETWORK_UNAVAILABLE;
                                 channel.write(ByteBuffer.wrap(response));
                                 close(key);
+                                System.out.println("Failed to find domain");
+                                return;
                             }
                             short clientPort = ByteBuffer.wrap(Arrays.copyOfRange(clientRequest, 5 + domainNameLength, 5 + domainNameLength + PORT_LENGTH)).getShort();
                             try {
                                 setConnection(address, clientPort, key, attachment);
+                                System.out.println("Requested connection through domain: " + address);
                             } catch (IOException e) {
                                 response[1] = ServerResponse.CONNECTION_FAILURE;
                                 channel.write(ByteBuffer.wrap(response));
                                 close(key);
+                                System.out.println("The host: " + address + " dropped the connection");
                             }
                         } else {
                             response[1] = ServerResponse.ADDRESS_TYPE_NOT_SUPPORTED;
                             channel.write(ByteBuffer.wrap(response));
                             close(key);
+                            System.out.println("IPv6 not supported");
                         }
                     } else {
                         response[1] = ServerResponse.INVALID_CONNECTION;
                         channel.write(ByteBuffer.wrap(response));
                         close(key);
+                        System.out.println("Command not supported");
                     }
                 } else {
                     response[1] = ServerResponse.PROTOCOL_ERROR;
                     channel.write(ByteBuffer.wrap(response));
                     close(key);
+                    System.out.println("SOCKS < SOCKS5 not supported");
                 }
             } else if (attachment.status == Status.TRANSATING) {
                 attachment.key.interestOps(attachment.key.interestOps() | SelectionKey.OP_WRITE);
@@ -123,24 +136,111 @@ public class SOCKS5Server implements Runnable{
         }
     }
 
+    private void connectToServer(SelectionKey key) throws IOException {
+        Attachment attachment = (Attachment) key.attachment();
+        byte[] clientGreeting = attachment.in.array();
+        if (clientGreeting[0] == ClientRequest.SOCKS5_VERSION) {
+            int numbOfMethods = clientGreeting[1];
+            int lastMethodAddr = numbOfMethods + 2;
+            boolean acceptableMethod = false;
+            for (int i = 2; i < lastMethodAddr; ++i) {
+                if (Arrays.asList(ServerResponse.ACCEPTABLE_METHODS).contains(clientGreeting[i])) {
+                    acceptableMethod = true;
+                    sendGreeting(key, clientGreeting[i]);
+                    attachment.status = Status.CONNECTED;
+                    attachment.in.clear();
+                    System.out.println("A new client has connected to the server");
+                    break;
+                }
+            }
+
+            if (!acceptableMethod) {
+                sendGreeting(key, ServerResponse.NO_ACCEPTABLE_METHODS);
+                close(key);
+                System.out.println("No supported method found");
+            }
+        } else {
+            sendGreeting(key, ServerResponse.NO_ACCEPTABLE_METHODS);
+            close(key);
+            System.out.println("SOCKS < SOCKS5 not supported");
+        }
+    }
+
     private void write(SelectionKey key) {
-        // TODO
+        Attachment attachment = (Attachment) key.attachment();
+        SocketChannel channel = (SocketChannel) key.channel();
+        if (key.isValid()) {
+            try {
+                channel.write(attachment.out);
+                if (attachment.out.remaining() == 0) {
+                    if (attachment.key == null) {
+                        close(key);
+                    } else {
+                        attachment.out.clear();
+                        attachment.key.interestOps(attachment.key.interestOps() | SelectionKey.OP_READ);
+                        key.interestOps(key.interestOps() ^ SelectionKey.OP_WRITE);
+                    }
+                }
+            } catch (IOException e) {
+                close(key);
+                e.printStackTrace();
+            }
+            
+        }
     }
 
     private void connect(SelectionKey key) {
-        //  TODO
+        Attachment attachment = (Attachment) key.attachment();
+        SocketChannel channel = (SocketChannel) key.channel();
+
+        try {
+            channel.finishConnect();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        attachment.in = ByteBuffer.allocate(BUF_SIZE);
+        attachment.in.put(createResponse()).flip();
+
+        attachment.out = ((Attachment)attachment.key.attachment()).in;
+        ((Attachment)attachment.key.attachment()).out = attachment.in;
+
+        ((Attachment)attachment.key.attachment()).status = Status.TRANSATING;
+        attachment.status = Status.TRANSATING;
+
+        attachment.key.interestOps(SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+        key.interestOps(0);
+
+        System.out.println("Connected to host");
     }
 
     private void close(SelectionKey key) {
-        // TODO
+        try {
+            key.channel().close();
+            SelectionKey selectionKey = ((Attachment) key.attachment()).key;
+            if (selectionKey != null) {
+                ((Attachment) selectionKey.attachment()).key = null;
+                if (selectionKey.isValid()) {
+                    if ((selectionKey.interestOps() & SelectionKey.OP_WRITE) == 0) {
+                        ((Attachment) selectionKey.attachment()).out.flip();
+                    }
+                    selectionKey.interestOps(SelectionKey.OP_WRITE);
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        key.cancel();
+        System.out.println("Connection close");
     }
 
     private byte[] createResponse() {
         byte[] response = new byte[4 + IPv4_LENGTH + PORT_LENGTH];
         byte[] ip = null;
-        try {
-            ip = InetAddress.getLocalHost().getAddress();
-        } catch (UnknownHostException e) {}
+        ip = this.host.getBytes();
+        // try {
+            
+        // } catch (UnknownHostException e) {}
+
         byte[] port = ByteBuffer.allocate(PORT_LENGTH).order(ByteOrder.BIG_ENDIAN).putShort((short)this.port).array();
         response[0] = ServerResponse.SOCKS5_VERSION;
         response[1] = ServerResponse.SUCCESSFUL_REQUEST;
@@ -149,6 +249,13 @@ public class SOCKS5Server implements Runnable{
         System.arraycopy(ip, 0, response, 4, IPv4_LENGTH);
         System.arraycopy(port, 0, response, 4 + IPv4_LENGTH, PORT_LENGTH);
         return response;
+    }
+
+    private void sendGreeting(SelectionKey key, byte responseByte) throws IOException {
+        byte[] response = new byte[2];
+        response[0] = ServerResponse.SOCKS5_VERSION;
+        response[1] = responseByte;
+        ((SocketChannel) key.channel()).write(ByteBuffer.allocate(2).put(response).flip());
     }
 
     private String getAddress(byte[] clientRequest, byte third) {
@@ -163,8 +270,13 @@ public class SOCKS5Server implements Runnable{
             startByte++;
         }
         try {
-            String ip = new String(Arrays.copyOfRange(clientRequest, startByte, startByte + addressLength));
-            address = InetAddress.getByName(ip).getHostAddress();
+            byte[] rowAddress = Arrays.copyOfRange(clientRequest, startByte, startByte + addressLength);
+            if (third == ClientRequest.IPv4_CONNECTION) {
+                address = InetAddress.getByAddress(rowAddress).getHostAddress();
+            } else if (third == ClientRequest.DOMAIN_CONNECTION) {
+                String ip = new String(rowAddress);
+                address = InetAddress.getByName(ip).getHostAddress();
+            }
         } catch (UnknownHostException e) {
             address = null;
             e.printStackTrace();
@@ -189,28 +301,36 @@ public class SOCKS5Server implements Runnable{
 
     @Override
     public void run() {
+        System.out.println("Server started at " + this.port + " port");
         while (true) {
             try {
                 selector.select();
+                if(!selector.isOpen()){
+                    continue;
+                }
                 Iterator<SelectionKey> keysIterator = selector.selectedKeys().iterator();
                 while (keysIterator.hasNext()) {
                     SelectionKey key = keysIterator.next();
                     keysIterator.remove();
-
+                    
                     if (key.isValid()) {
-                        if (key.isAcceptable()) {
-                            accept(key);
-                        } else if (key.isReadable()) {
-                            read(key);
-                        } else if (key.isWritable()) {
-                            write(key);
-                        } else if (key.isConnectable()) {
-                            connect(key);
+                        try {
+                            if (key.isAcceptable()) {
+                                accept(key);
+                            } else if (key.isReadable()) {
+                                read(key);
+                            } else if (key.isConnectable()) {
+                                connect(key);
+                            } else if (key.isWritable()) {
+                                write(key);
+                            }
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                            close(key);
                         }
                     }
                 }
             } catch (IOException e) {
-                // TODO
                 e.printStackTrace();
             }
         }
