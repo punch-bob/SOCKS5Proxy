@@ -237,9 +237,6 @@ public class SOCKS5Server implements Runnable{
         byte[] response = new byte[4 + IPv4_LENGTH + PORT_LENGTH];
         byte[] ip = null;
         ip = this.host.getBytes();
-        // try {
-            
-        // } catch (UnknownHostException e) {}
 
         byte[] port = ByteBuffer.allocate(PORT_LENGTH).order(ByteOrder.BIG_ENDIAN).putShort((short)this.port).array();
         response[0] = ServerResponse.SOCKS5_VERSION;
